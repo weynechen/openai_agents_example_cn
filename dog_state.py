@@ -20,6 +20,12 @@ class DogState:
     happiness: float = 70.0   # 0-100, affected by interactions
     last_update_time: float = None
     
+    # Long-term behavior tracking
+    current_behavior: str = None           # e.g., "sleeping", "eating"
+    behavior_start_time: float = None      # When behavior started
+    behavior_duration: float = None        # Expected duration in minutes
+    behavior_description: str = None       # Display description
+    
     def __post_init__(self):
         if self.last_update_time is None:
             self.last_update_time = time.time()
@@ -56,12 +62,15 @@ class DogState:
 class DogStateManager:
     """Manage dog state with SQLite persistence"""
     
-    def __init__(self, db_path: str = "dog_state.db"):
+    def __init__(self, db_path: str = "dog_state.db", time_scale: float = 1.0):
         self.db_path = db_path
         # Allow connection to be used across threads
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self._init_db()
         self.current_state = self._load_or_create_state()
+        
+        # Time scale: 1.0 = real-time, 60.0 = 1 second = 1 minute
+        self.time_scale = time_scale
     
     def _init_db(self):
         """Initialize database schema"""
@@ -92,13 +101,19 @@ class DogStateManager:
         """Update state based on elapsed time"""
         current_time = time.time()
         elapsed_seconds = current_time - self.current_state.last_update_time
-        elapsed_minutes = elapsed_seconds / 60.0
+        # Apply time scale
+        elapsed_minutes = (elapsed_seconds * self.time_scale) / 60.0
         
-        # Update values based on time
-        self.current_state.hunger += elapsed_minutes * 2.0    # +2 per minute
-        self.current_state.thirst += elapsed_minutes * 1.5    # +1.5 per minute
-        self.current_state.fatigue += elapsed_minutes * 1.0   # +1 per minute
-        self.current_state.boredom += elapsed_minutes * 1.5   # +1.5 per minute
+        # Update long-term behavior if active
+        if self.current_state.current_behavior:
+            self._update_behavior_progress(elapsed_minutes)
+        
+        # Update values based on time (only if not sleeping)
+        if self.current_state.current_behavior != "sleeping":
+            self.current_state.hunger += elapsed_minutes * 2.0    # +2 per minute
+            self.current_state.thirst += elapsed_minutes * 1.5    # +1.5 per minute
+            self.current_state.fatigue += elapsed_minutes * 1.0   # +1 per minute
+            self.current_state.boredom += elapsed_minutes * 1.5   # +1.5 per minute
         
         # Unhappiness increases if needs are not met
         if self.current_state.hunger > 70 or self.current_state.thirst > 70:
@@ -106,6 +121,148 @@ class DogStateManager:
         
         self.current_state.last_update_time = current_time
         self.current_state.clamp_values()
+    
+    def _update_behavior_progress(self, elapsed_minutes: float):
+        """Update progress of current long-term behavior"""
+        if not self.current_state.current_behavior:
+            return
+        
+        behavior = self.current_state.current_behavior
+        current_time = time.time()
+        behavior_elapsed_seconds = current_time - self.current_state.behavior_start_time
+        behavior_elapsed_minutes = (behavior_elapsed_seconds * self.time_scale) / 60.0
+        
+        # Check if behavior is complete
+        if behavior_elapsed_minutes >= self.current_state.behavior_duration:
+            self._complete_behavior()
+            return
+        
+        # Apply continuous effects based on behavior type
+        progress = behavior_elapsed_minutes / self.current_state.behavior_duration
+        
+        if behavior == "sleeping":
+            # Continuous fatigue reduction while sleeping
+            self.current_state.fatigue = max(0, 80 * (1 - progress))
+            self.current_state.boredom = max(0, 50 * (1 - progress * 0.5))
+            
+        elif behavior == "eating":
+            # Continuous hunger reduction while eating
+            initial_hunger = getattr(self.current_state, '_eating_initial_hunger', 80)
+            self.current_state.hunger = max(0, initial_hunger * (1 - progress))
+            
+        elif behavior == "drinking":
+            # Continuous thirst reduction while drinking
+            initial_thirst = getattr(self.current_state, '_drinking_initial_thirst', 80)
+            self.current_state.thirst = max(0, initial_thirst * (1 - progress))
+    
+    def _complete_behavior(self):
+        """Complete current behavior and apply final effects"""
+        behavior = self.current_state.current_behavior
+        
+        if behavior == "sleeping":
+            self.current_state.fatigue = 0
+            self.current_state.happiness += 10
+            print(f"[BEHAVIOR] ✅ Dog finished sleeping, fully rested!")
+            
+        elif behavior == "eating":
+            self.current_state.hunger = 0
+            self.current_state.happiness += 15
+            print(f"[BEHAVIOR] ✅ Dog finished eating, fully fed!")
+            
+        elif behavior == "drinking":
+            self.current_state.thirst = 0
+            self.current_state.happiness += 10
+            print(f"[BEHAVIOR] ✅ Dog finished drinking, fully hydrated!")
+        
+        # Clear behavior
+        self.current_state.current_behavior = None
+        self.current_state.behavior_start_time = None
+        self.current_state.behavior_duration = None
+        self.current_state.behavior_description = None
+        
+        # Set flag to indicate behavior just completed
+        self.current_state._behavior_just_completed = True
+        
+        self.save_state()
+    
+    def check_and_clear_completion_flag(self) -> bool:
+        """Check if a behavior just completed and clear the flag"""
+        if hasattr(self.current_state, '_behavior_just_completed') and self.current_state._behavior_just_completed:
+            self.current_state._behavior_just_completed = False
+            return True
+        return False
+    
+    def start_behavior(self, behavior_type: str, duration_minutes: float, description: str):
+        """Start a long-term behavior"""
+        if self.is_busy():
+            return False, f"狗狗正在{self.current_state.behavior_description}，不能开始新行为"
+        
+        self.current_state.current_behavior = behavior_type
+        self.current_state.behavior_start_time = time.time()
+        self.current_state.behavior_duration = duration_minutes
+        self.current_state.behavior_description = description
+        
+        # Store initial values for some behaviors
+        if behavior_type == "eating":
+            self.current_state._eating_initial_hunger = self.current_state.hunger
+        elif behavior_type == "drinking":
+            self.current_state._drinking_initial_thirst = self.current_state.thirst
+        
+        self.save_state()
+        
+        actual_duration = duration_minutes / self.time_scale
+        print(f"[BEHAVIOR] Started {behavior_type} for {duration_minutes} virtual minutes (actual: {actual_duration:.1f} minutes)")
+        
+        return True, f"开始{description}... (需要 {duration_minutes:.0f} 分钟)"
+    
+    def interrupt_behavior(self, reason: str = "被主人打断"):
+        """Interrupt current behavior"""
+        if not self.current_state.current_behavior:
+            return False, "狗狗没有在做需要打断的事情"
+        
+        behavior = self.current_state.current_behavior
+        print(f"[BEHAVIOR] {behavior} interrupted: {reason}")
+        
+        # Clear behavior without completing
+        self.current_state.current_behavior = None
+        self.current_state.behavior_start_time = None
+        self.current_state.behavior_duration = None
+        self.current_state.behavior_description = None
+        
+        self.save_state()
+        return True, f"{reason}，停止了之前的行为"
+    
+    def is_busy(self) -> bool:
+        """Check if dog is currently doing a long-term behavior"""
+        if not self.current_state.current_behavior:
+            return False
+        
+        current_time = time.time()
+        elapsed_seconds = current_time - self.current_state.behavior_start_time
+        elapsed_minutes = (elapsed_seconds * self.time_scale) / 60.0
+        
+        return elapsed_minutes < self.current_state.behavior_duration
+    
+    def get_behavior_progress(self) -> dict:
+        """Get progress information of current behavior"""
+        if not self.current_state.current_behavior:
+            return None
+        
+        current_time = time.time()
+        elapsed_seconds = current_time - self.current_state.behavior_start_time
+        elapsed_minutes = (elapsed_seconds * self.time_scale) / 60.0
+        
+        remaining_minutes = max(0, self.current_state.behavior_duration - elapsed_minutes)
+        progress_percent = min(100, (elapsed_minutes / self.current_state.behavior_duration) * 100)
+        
+        return {
+            "behavior": self.current_state.current_behavior,
+            "description": self.current_state.behavior_description,
+            "elapsed_minutes": elapsed_minutes,
+            "remaining_minutes": remaining_minutes,
+            "total_minutes": self.current_state.behavior_duration,
+            "progress_percent": progress_percent
+        }
     
     def save_state(self):
         """Save current state to database"""
@@ -135,6 +292,16 @@ class DogStateManager:
         self.save_state()
         
         state = self.current_state
+        
+        # Check if busy with long-term behavior
+        if self.is_busy():
+            progress = self.get_behavior_progress()
+            return f"""当前状态: 正在{progress['description']}
+- 已进行: {progress['elapsed_minutes']:.1f} 分钟
+- 还需要: {progress['remaining_minutes']:.1f} 分钟
+- 进度: {progress['progress_percent']:.1f}%
+
+注意: 狗狗正忙着，无法执行其他长时间行为。可以执行快速行为如摇尾巴、吠叫等，或者主人可以打断当前行为。"""
         
         # Determine needs
         needs = []
